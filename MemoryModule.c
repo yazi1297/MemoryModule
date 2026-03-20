@@ -99,6 +99,10 @@ typedef struct {
 #endif
 } MEMORYMODULE, *PMEMORYMODULE;
 
+// When loading for emulator use-cases, we may want to keep DISCARDABLE
+// sections committed so the caller can safely copy a contiguous image blob.
+static int g_keep_discardable_sections = 0;
+
 typedef struct {
     LPVOID address;
     LPVOID alignedAddress;
@@ -271,16 +275,23 @@ FinalizeSection(PMEMORYMODULE module, PSECTIONFINALIZEDATA sectionData) {
     }
 
     if (sectionData->characteristics & IMAGE_SCN_MEM_DISCARDABLE) {
-        // section is not needed any more and can safely be freed
-        if (sectionData->address == sectionData->alignedAddress &&
-            (sectionData->last ||
-             module->headers->OptionalHeader.SectionAlignment == module->pageSize ||
-             (sectionData->size % module->pageSize) == 0)
-           ) {
-            // Only allowed to decommit whole pages
-            module->free(sectionData->address, sectionData->size, MEM_DECOMMIT, module->userdata);
+        // Default behavior decommits DISCARDABLE sections.
+        // For our "copy whole blob to emulator memory" workflow, that may
+        // make the source blob unreadable and crash memcpy/uc_mem_write.
+        if (!g_keep_discardable_sections) {
+            // section is not needed any more and can safely be freed
+            if (sectionData->address == sectionData->alignedAddress &&
+                (sectionData->last ||
+                 module->headers->OptionalHeader.SectionAlignment == module->pageSize ||
+                 (sectionData->size % module->pageSize) == 0)
+               ) {
+                // Only allowed to decommit whole pages
+                module->free(sectionData->address, sectionData->size, MEM_DECOMMIT, module->userdata);
+            }
+            return TRUE;
         }
-        return TRUE;
+        // Keep discardable committed: fall through and only apply protections
+        // (like non-discardable sections). This keeps the image blob readable.
     }
 
     // determine protection flags based on characteristics
@@ -539,6 +550,76 @@ void MemoryDefaultFreeLibrary(HCUSTOMMODULE module, void *userdata)
 HMEMORYMODULE MemoryLoadLibrary(const void *data, size_t size)
 {
     return MemoryLoadLibraryEx(data, size, MemoryDefaultAlloc, MemoryDefaultFree, MemoryDefaultLoadLibrary, MemoryDefaultGetProcAddress, MemoryDefaultFreeLibrary, NULL);
+}
+
+/*
+ * Load EXE/DLL from memory with relocations applied to a requested
+ * desired_base_addr (libpeconv-like behavior).
+ *
+ * MemoryModule itself already does relocations based on the host allocation
+ * ImageBase. Here we additionally shift the already-relocated in-memory image
+ * by (desired_base_addr - actual_loaded_image_base) using the base relocation
+ * directory, so that internal absolute addresses match desired_base_addr.
+ *
+ * out_base_addr:
+ *   actual host pointer where the image blob is stored.
+ * out_image_size:
+ *   contiguous allocated size (aligned image size).
+ */
+HMEMORYMODULE MemoryLoadLibraryDesiredBase(const void *data,
+                                             size_t size,
+                                             uintptr_t desired_base_addr,
+                                             LPVOID *out_base_addr,
+                                             size_t *out_image_size)
+{
+    if (out_base_addr) {
+        *out_base_addr = NULL;
+    }
+    if (out_image_size) {
+        *out_image_size = 0;
+    }
+
+    // Keep DISCARDABLE sections committed so the returned in-memory
+    // contiguous blob remains readable for uc_mem_write/memcpy.
+    g_keep_discardable_sections = 1;
+    HMEMORYMODULE mod = MemoryLoadLibraryEx(data, size,
+        MemoryDefaultAlloc,
+        MemoryDefaultFree,
+        MemoryDefaultLoadLibrary,
+        MemoryDefaultGetProcAddress,
+        MemoryDefaultFreeLibrary,
+        NULL);
+    g_keep_discardable_sections = 0;
+
+    if (mod == NULL) {
+        return NULL;
+    }
+
+    PMEMORYMODULE module = (PMEMORYMODULE)mod;
+
+    if (out_base_addr) {
+        *out_base_addr = (LPVOID)module->codeBase;
+    }
+
+    if (out_image_size) {
+        *out_image_size = AlignValueUp(module->headers->OptionalHeader.SizeOfImage, module->pageSize);
+    }
+
+    if (desired_base_addr != 0) {
+        uintptr_t actual_base = (uintptr_t)module->headers->OptionalHeader.ImageBase;
+        ptrdiff_t delta = (ptrdiff_t)((intptr_t)desired_base_addr - (intptr_t)actual_base);
+        if (delta != 0) {
+            BOOL ok = PerformBaseRelocation(module, delta);
+            if (!ok) {
+                MemoryFreeLibrary(mod);
+                return NULL;
+            }
+            module->headers->OptionalHeader.ImageBase = (uintptr_t)desired_base_addr;
+            module->isRelocated = TRUE;
+        }
+    }
+
+    return mod;
 }
 
 HMEMORYMODULE MemoryLoadLibraryEx(const void *data, size_t size,
@@ -900,6 +981,28 @@ int MemoryCallEntryPoint(HMEMORYMODULE mod)
     }
 
     return module->exeEntry();
+}
+
+LPVOID MemoryGetEntryPoint(HMEMORYMODULE mod)
+{
+    PMEMORYMODULE module = (PMEMORYMODULE)mod;
+
+    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated) {
+        return NULL;
+    }
+
+    return (LPVOID)module->exeEntry;
+}
+
+LPVOID MemoryGetBaseAddress(HMEMORYMODULE mod)
+{
+    PMEMORYMODULE module = (PMEMORYMODULE)mod;
+
+    if (module == NULL) {
+        return NULL;
+    }
+
+    return (LPVOID)module->codeBase;
 }
 
 #define DEFAULT_LANGUAGE        MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL)

@@ -28,6 +28,7 @@
 #define __MEMORY_MODULE_HEADER
 
 #include <windows.h>
+#include <stdint.h>
 
 typedef void *HMEMORYMODULE;
 
@@ -52,6 +53,25 @@ typedef void (*CustomFreeLibraryFunc)(HCUSTOMMODULE, void *);
  * calls through the Windows API.
  */
 HMEMORYMODULE MemoryLoadLibrary(const void *, size_t);
+
+/**
+ * Load EXE/DLL from memory location with the given size using a requested
+ * desired virtual base address.
+ *
+ * This follows MemoryModule's normal PE loading steps (section alignment,
+ * base relocation, import fixing, export/resource support). The loader will
+ * relocate the in-memory image as if it was loaded at desired_base_addr,
+ * even if host allocation had to fall back to a different address.
+ *
+ * Returns:
+ *  - out_base_addr: the actual host pointer where the image blob is stored
+ *  - out_image_size: the contiguous allocated size (aligned image size)
+ */
+HMEMORYMODULE MemoryLoadLibraryDesiredBase(const void *data,
+                                             size_t size,
+                                             uintptr_t desired_base_addr,
+                                             LPVOID *out_base_addr,
+                                             size_t *out_image_size);
 
 /**
  * Load EXE/DLL from memory location with the given size using custom dependency
@@ -90,6 +110,21 @@ void MemoryFreeLibrary(HMEMORYMODULE);
  * Returns a negative value if the entry point could not be executed.
  */
 int MemoryCallEntryPoint(HMEMORYMODULE);
+
+/**
+ * Get entry point address (EXE only).
+ *
+ * Returns the address of the entry point if the module is a valid EXE,
+ * otherwise returns NULL.
+ */
+LPVOID MemoryGetEntryPoint(HMEMORYMODULE);
+
+/**
+ * Get base address of loaded module.
+ *
+ * Returns the base address where the module is loaded in memory.
+ */
+LPVOID MemoryGetBaseAddress(HMEMORYMODULE);
 
 /**
  * Find the location of a resource with the specified type and name.
