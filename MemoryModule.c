@@ -549,7 +549,11 @@ void MemoryDefaultFreeLibrary(HCUSTOMMODULE module, void *userdata)
 
 HMEMORYMODULE MemoryLoadLibrary(const void *data, size_t size)
 {
-    return MemoryLoadLibraryEx(data, size, MemoryDefaultAlloc, MemoryDefaultFree, MemoryDefaultLoadLibrary, MemoryDefaultGetProcAddress, MemoryDefaultFreeLibrary, NULL);
+    g_keep_discardable_sections = 1;
+    HMEMORYMODULE hMod = MemoryLoadLibraryEx(data, size, MemoryDefaultAlloc, MemoryDefaultFree, MemoryDefaultLoadLibrary,
+                                            MemoryDefaultGetProcAddress, MemoryDefaultFreeLibrary, NULL);
+    g_keep_discardable_sections = 0;
+    return hMod;
 }
 
 /*
@@ -1003,6 +1007,16 @@ LPVOID MemoryGetBaseAddress(HMEMORYMODULE mod)
     }
 
     return (LPVOID)module->codeBase;
+}
+
+DWORD MemoryGetImageSize(HMEMORYMODULE mod)
+{
+    PMEMORYMODULE module = (PMEMORYMODULE)mod;
+    if (module == NULL) {
+        return 0;
+    }
+
+    return AlignValueUp(module->headers->OptionalHeader.SizeOfImage, module->pageSize);
 }
 
 #define DEFAULT_LANGUAGE        MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL)

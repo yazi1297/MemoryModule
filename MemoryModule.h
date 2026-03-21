@@ -126,6 +126,12 @@ LPVOID MemoryGetEntryPoint(HMEMORYMODULE);
  */
 LPVOID MemoryGetBaseAddress(HMEMORYMODULE);
 
+
+/**
+ * Get the image size of the module in bytes.
+ */
+DWORD MemoryGetImageSize(HMEMORYMODULE);
+
 /**
  * Find the location of a resource with the specified type and name.
  */
