@@ -36,6 +36,12 @@ typedef void *HMEMORYRSRC;
 
 typedef void *HCUSTOMMODULE;
 
+// Target architecture selector for emulator-oriented loading.
+// AUTO: select by PE header machine and host compatibility.
+#define MEMORYMODULE_ARCH_AUTO 0
+#define MEMORYMODULE_ARCH_X86  1
+#define MEMORYMODULE_ARCH_X64  2
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -74,6 +80,22 @@ HMEMORYMODULE MemoryLoadLibraryDesiredBase(const void *data,
                                              uintptr_t desired_base_addr,
                                              LPVOID *out_base_addr,
                                              size_t *out_image_size);
+
+/**
+ * Load EXE/DLL with explicit target architecture selector.
+ *
+ * target_arch:
+ *   - MEMORYMODULE_ARCH_AUTO / X86 / X64
+ *
+ * For host-matching targets, strict loader path is used.
+ * For cross-arch emulator use-cases, relaxed loader path is used.
+ */
+HMEMORYMODULE MemoryLoadLibraryDesiredBaseForArch(const void *data,
+                                                    size_t size,
+                                                    int target_arch,
+                                                    uintptr_t desired_base_addr,
+                                                    LPVOID *out_base_addr,
+                                                    size_t *out_image_size);
 
 /**
  * Load EXE/DLL from memory location with the given size using custom dependency
@@ -135,6 +157,12 @@ LPVOID MemoryGetEntryPoint(HMEMORYMODULE);
  */
 LPVOID MemoryGetBaseAddress(HMEMORYMODULE);
 
+/**
+ * Get image base address of loaded module.
+ *
+ * Returns the image base address where the module is loaded in memory.
+ */
+ULONGLONG MemoryGetImageBase(HMEMORYMODULE);
 
 /**
  * Get the image size of the module in bytes.

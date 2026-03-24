@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Memory DLL loading code
  * Version 0.0.4
  *
@@ -547,6 +547,23 @@ void MemoryDefaultFreeLibrary(HCUSTOMMODULE module, void *userdata)
     FreeLibrary((HMODULE) module);
 }
 
+static WORD
+ReadPeMachine(const void *data, size_t size)
+{
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)data;
+    if (!CheckSize(size, sizeof(IMAGE_DOS_HEADER)) || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return 0;
+    }
+    if (!CheckSize(size, dos->e_lfanew + sizeof(IMAGE_NT_HEADERS))) {
+        return 0;
+    }
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)&((const unsigned char *)data)[dos->e_lfanew];
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return 0;
+    }
+    return nt->FileHeader.Machine;
+}
+
 HMEMORYMODULE MemoryLoadLibrary(const void *data, size_t size)
 {
     g_keep_discardable_sections = 1;
@@ -614,6 +631,85 @@ HMEMORYMODULE MemoryLoadLibraryDesiredBase(const void *data,
         *out_base_addr = (LPVOID)module->codeBase;
     }
 
+    if (out_image_size) {
+        *out_image_size = AlignValueUp(module->headers->OptionalHeader.SizeOfImage, module->pageSize);
+    }
+
+    if (desired_base_addr != 0) {
+        uintptr_t actual_base = (uintptr_t)module->headers->OptionalHeader.ImageBase;
+        ptrdiff_t delta = (ptrdiff_t)((intptr_t)desired_base_addr - (intptr_t)actual_base);
+        if (delta != 0) {
+            BOOL ok = PerformBaseRelocation(module, delta);
+            if (!ok) {
+                MemoryFreeLibrary(mod);
+                return NULL;
+            }
+            module->headers->OptionalHeader.ImageBase = (uintptr_t)desired_base_addr;
+            module->isRelocated = TRUE;
+        }
+    }
+
+    return mod;
+}
+
+HMEMORYMODULE MemoryLoadLibraryDesiredBaseForArch(const void *data,
+                                                    size_t size,
+                                                    int target_arch,
+                                                    uintptr_t desired_base_addr,
+                                                    LPVOID *out_base_addr,
+                                                    size_t *out_image_size)
+{
+    if (out_base_addr) {
+        *out_base_addr = NULL;
+    }
+    if (out_image_size) {
+        *out_image_size = 0;
+    }
+
+    WORD peMachine = ReadPeMachine(data, size);
+    if (peMachine == 0) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    WORD expectedMachine = 0;
+    if (target_arch == MEMORYMODULE_ARCH_X86) {
+        expectedMachine = IMAGE_FILE_MACHINE_I386;
+    } else if (target_arch == MEMORYMODULE_ARCH_X64) {
+        expectedMachine = IMAGE_FILE_MACHINE_AMD64;
+    } else if (target_arch != MEMORYMODULE_ARCH_AUTO) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    if (expectedMachine != 0 && peMachine != expectedMachine) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    // Host-matching PE uses strict loader path; cross-arch emulator use-case
+    // uses relaxed path (Ex2) that does not enforce HOST_MACHINE check.
+    BOOL crossArch = (peMachine != HOST_MACHINE);
+
+    g_keep_discardable_sections = 1;
+    HMEMORYMODULE mod = crossArch
+        ? MemoryLoadLibraryEx2(data, size, MemoryDefaultAlloc, MemoryDefaultFree,
+                               MemoryDefaultLoadLibrary, MemoryDefaultGetProcAddress,
+                               MemoryDefaultFreeLibrary, NULL)
+        : MemoryLoadLibraryEx(data, size, MemoryDefaultAlloc, MemoryDefaultFree,
+                              MemoryDefaultLoadLibrary, MemoryDefaultGetProcAddress,
+                              MemoryDefaultFreeLibrary, NULL);
+    g_keep_discardable_sections = 0;
+
+    if (mod == NULL) {
+        return NULL;
+    }
+
+    PMEMORYMODULE module = (PMEMORYMODULE)mod;
+
+    if (out_base_addr) {
+        *out_base_addr = (LPVOID)module->codeBase;
+    }
     if (out_image_size) {
         *out_image_size = AlignValueUp(module->headers->OptionalHeader.SizeOfImage, module->pageSize);
     }
@@ -897,10 +993,12 @@ HMEMORYMODULE MemoryLoadLibraryEx2(const void *data, size_t size,
         return NULL;
     }
 
+    /*
     if (old_header->FileHeader.Machine != HOST_MACHINE) {
         SetLastError(ERROR_BAD_EXE_FORMAT);
         return NULL;
     }
+    */
 
     if (old_header->OptionalHeader.SectionAlignment & 1) {
         // Only support section alignments that are a multiple of 2
@@ -1239,6 +1337,17 @@ LPVOID MemoryGetBaseAddress(HMEMORYMODULE mod)
     }
 
     return (LPVOID)module->codeBase;
+}
+
+ULONGLONG MemoryGetImageBase(HMEMORYMODULE mod)
+{
+    PMEMORYMODULE module = (PMEMORYMODULE)mod;
+    if (module == NULL)
+    {
+        return 0;
+    }
+
+    return module->headers->OptionalHeader.ImageBase;
 }
 
 DWORD MemoryGetImageSize(HMEMORYMODULE mod)
