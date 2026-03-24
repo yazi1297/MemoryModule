@@ -54,6 +54,8 @@ typedef void (*CustomFreeLibraryFunc)(HCUSTOMMODULE, void *);
  */
 HMEMORYMODULE MemoryLoadLibrary(const void *, size_t);
 
+HMEMORYMODULE MemoryLoadLibrary2(const void *, size_t);
+
 /**
  * Load EXE/DLL from memory location with the given size using a requested
  * desired virtual base address.
@@ -87,6 +89,13 @@ HMEMORYMODULE MemoryLoadLibraryEx(const void *, size_t,
     CustomFreeLibraryFunc,
     void *);
 
+HMEMORYMODULE MemoryLoadLibraryEx2(const void *, size_t,
+    CustomAllocFunc,
+    CustomFreeFunc,
+    CustomLoadLibraryFunc,
+    CustomGetProcAddressFunc,
+    CustomFreeLibraryFunc,
+    void *);
 /**
  * Get address of exported method. Supports loading both by name and by
  * ordinal value.

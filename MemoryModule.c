@@ -556,6 +556,15 @@ HMEMORYMODULE MemoryLoadLibrary(const void *data, size_t size)
     return hMod;
 }
 
+HMEMORYMODULE MemoryLoadLibrary2(const void *data, size_t size)
+{
+    g_keep_discardable_sections = 1;
+    HMEMORYMODULE hMod = MemoryLoadLibraryEx2(data, size, MemoryDefaultAlloc, MemoryDefaultFree, MemoryDefaultLoadLibrary,
+                                            MemoryDefaultGetProcAddress, MemoryDefaultFreeLibrary, NULL);
+    g_keep_discardable_sections = 0;
+    return hMod;
+}
+
 /*
  * Load EXE/DLL from memory with relocations applied to a requested
  * desired_base_addr (libpeconv-like behavior).
@@ -821,6 +830,229 @@ HMEMORYMODULE MemoryLoadLibraryEx(const void *data, size_t size,
         goto error;
     }
 
+    // get entry point of loaded library
+    if (result->headers->OptionalHeader.AddressOfEntryPoint != 0) {
+        if (result->isDLL) {
+            DllEntryProc DllEntry = (DllEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
+            // notify library about attaching to process
+            BOOL successfull = (*DllEntry)((HINSTANCE)code, DLL_PROCESS_ATTACH, 0);
+            if (!successfull) {
+                SetLastError(ERROR_DLL_INIT_FAILED);
+                goto error;
+            }
+            result->initialized = TRUE;
+        } else {
+            result->exeEntry = (ExeEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
+        }
+    } else {
+        result->exeEntry = NULL;
+    }
+
+    return (HMEMORYMODULE)result;
+
+error:
+    // cleanup
+    MemoryFreeLibrary(result);
+    return NULL;
+}
+
+HMEMORYMODULE MemoryLoadLibraryEx2(const void *data, size_t size,
+    CustomAllocFunc allocMemory,
+    CustomFreeFunc freeMemory,
+    CustomLoadLibraryFunc loadLibrary,
+    CustomGetProcAddressFunc getProcAddress,
+    CustomFreeLibraryFunc freeLibrary,
+    void *userdata)
+{
+    PMEMORYMODULE result = NULL;
+    PIMAGE_DOS_HEADER dos_header;
+    PIMAGE_NT_HEADERS old_header;
+    unsigned char *code, *headers;
+    ptrdiff_t locationDelta;
+    SYSTEM_INFO sysInfo;
+    PIMAGE_SECTION_HEADER section;
+    DWORD i;
+    size_t optionalSectionSize;
+    size_t lastSectionEnd = 0;
+    size_t alignedImageSize;
+#ifdef _WIN64
+    POINTER_LIST *blockedMemory = NULL;
+#endif
+
+    if (!CheckSize(size, sizeof(IMAGE_DOS_HEADER))) {
+        return NULL;
+    }
+    dos_header = (PIMAGE_DOS_HEADER)data;
+    if (dos_header->e_magic != IMAGE_DOS_SIGNATURE) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    if (!CheckSize(size, dos_header->e_lfanew + sizeof(IMAGE_NT_HEADERS))) {
+        return NULL;
+    }
+    old_header = (PIMAGE_NT_HEADERS)&((const unsigned char *)(data))[dos_header->e_lfanew];
+    if (old_header->Signature != IMAGE_NT_SIGNATURE) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    if (old_header->FileHeader.Machine != HOST_MACHINE) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    if (old_header->OptionalHeader.SectionAlignment & 1) {
+        // Only support section alignments that are a multiple of 2
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    section = IMAGE_FIRST_SECTION(old_header);
+    optionalSectionSize = old_header->OptionalHeader.SectionAlignment;
+    for (i=0; i<old_header->FileHeader.NumberOfSections; i++, section++) {
+        size_t endOfSection;
+        if (section->SizeOfRawData == 0) {
+            // Section without data in the DLL
+            endOfSection = section->VirtualAddress + optionalSectionSize;
+        } else {
+            endOfSection = section->VirtualAddress + section->SizeOfRawData;
+        }
+
+        if (endOfSection > lastSectionEnd) {
+            lastSectionEnd = endOfSection;
+        }
+    }
+
+    GetNativeSystemInfo(&sysInfo);
+    alignedImageSize = AlignValueUp(old_header->OptionalHeader.SizeOfImage, sysInfo.dwPageSize);
+    if (alignedImageSize != AlignValueUp(lastSectionEnd, sysInfo.dwPageSize)) {
+        SetLastError(ERROR_BAD_EXE_FORMAT);
+        return NULL;
+    }
+
+    // reserve memory for image of library
+    // XXX: is it correct to commit the complete memory region at once?
+    //      calling DllEntry raises an exception if we don't...
+    code = (unsigned char *)allocMemory((LPVOID)(old_header->OptionalHeader.ImageBase),
+        alignedImageSize,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+        userdata);
+
+    if (code == NULL) {
+        // try to allocate memory at arbitrary position
+        code = (unsigned char *)allocMemory(NULL,
+            alignedImageSize,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            userdata);
+        if (code == NULL) {
+            SetLastError(ERROR_OUTOFMEMORY);
+            return NULL;
+        }
+    }
+
+#ifdef _WIN64
+    // Memory block may not span 4 GB boundaries.
+    while ((((uintptr_t) code) >> 32) < (((uintptr_t) (code + alignedImageSize)) >> 32)) {
+        POINTER_LIST *node = (POINTER_LIST*) malloc(sizeof(POINTER_LIST));
+        if (!node) {
+            freeMemory(code, 0, MEM_RELEASE, userdata);
+            FreePointerList(blockedMemory, freeMemory, userdata);
+            SetLastError(ERROR_OUTOFMEMORY);
+            return NULL;
+        }
+
+        node->next = blockedMemory;
+        node->address = code;
+        blockedMemory = node;
+
+        code = (unsigned char *)allocMemory(NULL,
+            alignedImageSize,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+            userdata);
+        if (code == NULL) {
+            FreePointerList(blockedMemory, freeMemory, userdata);
+            SetLastError(ERROR_OUTOFMEMORY);
+            return NULL;
+        }
+    }
+#endif
+
+    result = (PMEMORYMODULE)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(MEMORYMODULE));
+    if (result == NULL) {
+        freeMemory(code, 0, MEM_RELEASE, userdata);
+#ifdef _WIN64
+        FreePointerList(blockedMemory, freeMemory, userdata);
+#endif
+        SetLastError(ERROR_OUTOFMEMORY);
+        return NULL;
+    }
+
+    result->codeBase = code;
+    result->isDLL = (old_header->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+    result->alloc = allocMemory;
+    result->free = freeMemory;
+    result->loadLibrary = loadLibrary;
+    result->getProcAddress = getProcAddress;
+    result->freeLibrary = freeLibrary;
+    result->userdata = userdata;
+    result->pageSize = sysInfo.dwPageSize;
+#ifdef _WIN64
+    result->blockedMemory = blockedMemory;
+#endif
+
+    if (!CheckSize(size, old_header->OptionalHeader.SizeOfHeaders)) {
+        goto error;
+    }
+
+    // commit memory for headers
+    headers = (unsigned char *)allocMemory(code,
+        old_header->OptionalHeader.SizeOfHeaders,
+        MEM_COMMIT,
+        PAGE_READWRITE,
+        userdata);
+
+    // copy PE header to code
+    memcpy(headers, dos_header, old_header->OptionalHeader.SizeOfHeaders);
+    result->headers = (PIMAGE_NT_HEADERS)&((const unsigned char *)(headers))[dos_header->e_lfanew];
+
+    // update position
+    result->headers->OptionalHeader.ImageBase = (uintptr_t)code;
+
+    // copy sections from DLL file block to new memory location
+    if (!CopySections((const unsigned char *) data, size, old_header, result)) {
+        goto error;
+    }
+#if 0
+    // adjust base address of imported data
+    locationDelta = (ptrdiff_t)(result->headers->OptionalHeader.ImageBase - old_header->OptionalHeader.ImageBase);
+    if (locationDelta != 0) {
+        result->isRelocated = PerformBaseRelocation(result, locationDelta);
+    } else {
+        result->isRelocated = TRUE;
+    }
+#endif
+#if 0
+    // load required dlls and adjust function table of imports
+    if (!BuildImportTable(result)) {
+        goto error;
+    }
+#endif
+#if 0
+    // mark memory pages depending on section headers and release
+    // sections that are marked as "discardable"
+    if (!FinalizeSections(result)) {
+        goto error;
+    }
+
+    // TLS callbacks are executed BEFORE the main loading
+    if (!ExecuteTLS(result)) {
+        goto error;
+    }
+    #endif
     // get entry point of loaded library
     if (result->headers->OptionalHeader.AddressOfEntryPoint != 0) {
         if (result->isDLL) {
