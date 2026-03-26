@@ -1,4 +1,4 @@
-﻿/*
+/*
  * Memory DLL loading code
  * Version 0.0.4
  *
@@ -926,19 +926,16 @@ HMEMORYMODULE MemoryLoadLibraryEx(const void *data, size_t size,
         goto error;
     }
 
-    // get entry point of loaded library
+    // get entry point of loaded module
+    //
+    // NOTE:
+    // MemoryLoadLibraryEx2 is used for relaxed/cross-arch scenarios (e.g. x64 host loading x86 PE for Unicorn).
+    // We still expose the entrypoint address so the emulator/runtime can invoke it inside target CPU context.
     if (result->headers->OptionalHeader.AddressOfEntryPoint != 0) {
+        result->exeEntry = (ExeEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
+        // For DLLs, exeEntry points to DllMain. The emulator/runtime should decide if/when to call it.
         if (result->isDLL) {
-            DllEntryProc DllEntry = (DllEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
-            // notify library about attaching to process
-            BOOL successfull = (*DllEntry)((HINSTANCE)code, DLL_PROCESS_ATTACH, 0);
-            if (!successfull) {
-                SetLastError(ERROR_DLL_INIT_FAILED);
-                goto error;
-            }
-            result->initialized = TRUE;
-        } else {
-            result->exeEntry = (ExeEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
+            result->initialized = FALSE;
         }
     } else {
         result->exeEntry = NULL;
@@ -1151,19 +1148,16 @@ HMEMORYMODULE MemoryLoadLibraryEx2(const void *data, size_t size,
         goto error;
     }
     #endif
-    // get entry point of loaded library
+    // get entry point of loaded module
+    //
+    // NOTE:
+    // MemoryLoadLibraryEx2 is used for relaxed/cross-arch scenarios (e.g. x64 host loading x86 PE for Unicorn).
+    // We still expose the entrypoint address so the emulator/runtime can invoke it inside target CPU context.
     if (result->headers->OptionalHeader.AddressOfEntryPoint != 0) {
+        result->exeEntry = (ExeEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
+        // For DLLs, exeEntry points to DllMain. The emulator/runtime should decide if/when to call it.
         if (result->isDLL) {
-            DllEntryProc DllEntry = (DllEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
-            // notify library about attaching to process
-            BOOL successfull = (*DllEntry)((HINSTANCE)code, DLL_PROCESS_ATTACH, 0);
-            if (!successfull) {
-                SetLastError(ERROR_DLL_INIT_FAILED);
-                goto error;
-            }
-            result->initialized = TRUE;
-        } else {
-            result->exeEntry = (ExeEntryProc)(LPVOID)(code + result->headers->OptionalHeader.AddressOfEntryPoint);
+            result->initialized = FALSE;
         }
     } else {
         result->exeEntry = NULL;
@@ -1310,7 +1304,7 @@ int MemoryCallEntryPoint(HMEMORYMODULE mod)
 {
     PMEMORYMODULE module = (PMEMORYMODULE)mod;
 
-    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated) {
+    if (module == NULL || module->exeEntry == NULL || !module->isRelocated) {
         return -1;
     }
 
@@ -1321,7 +1315,7 @@ LPVOID MemoryGetEntryPoint(HMEMORYMODULE mod)
 {
     PMEMORYMODULE module = (PMEMORYMODULE)mod;
 
-    if (module == NULL || module->isDLL || module->exeEntry == NULL || !module->isRelocated) {
+    if (module == NULL || module->exeEntry == NULL) {
         return NULL;
     }
 
